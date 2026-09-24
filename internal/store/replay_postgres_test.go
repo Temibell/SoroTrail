@@ -2,20 +2,61 @@ package store
 
 import (
 	"encoding/json"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
+// Table test for the replay projection helper (issue #769). A wrong
+// projection replays the wrong rows.
 func TestEventIDs(t *testing.T) {
-	events := []EventDecoding{
-		{ID: "evt-1", Topics: json.RawMessage(`["a"]`), Value: json.RawMessage(`{"v":1}`)},
-		{ID: "evt-2", Topics: json.RawMessage(`["b"]`), Value: json.RawMessage(`{"v":2}`)},
+	cases := []struct {
+		name   string
+		events []EventDecoding
+		want   []string
+	}{
+		{
+			name: "populated batch yields ids in the same order",
+			events: []EventDecoding{
+				{ID: "evt-1", Topics: json.RawMessage(`["a"]`), Value: json.RawMessage(`{"v":1}`)},
+				{ID: "evt-2", Topics: json.RawMessage(`["b"]`), Value: json.RawMessage(`{"v":2}`)},
+				{ID: "evt-3"},
+			},
+			want: []string{"evt-1", "evt-2", "evt-3"},
+		},
+		{
+			name:   "empty batch yields an empty slice rather than nil",
+			events: []EventDecoding{},
+			want:   []string{},
+		},
+		{
+			name:   "nil batch yields an empty slice rather than nil",
+			events: nil,
+			want:   []string{},
+		},
+		{
+			name: "duplicate ids are preserved positionally",
+			// The batch feeds UPDATE ... FROM (SELECT unnest($1::text[])) ...
+			// with parallel unnest arrays, so ids must stay index-aligned with
+			// the topics/values arrays — de-duplicating here would corrupt the
+			// row-wise pairing and replay the wrong rows.
+			events: []EventDecoding{
+				{ID: "evt-1"},
+				{ID: "evt-1"},
+				{ID: "evt-2"},
+			},
+			want: []string{"evt-1", "evt-1", "evt-2"},
+		},
 	}
-	if got, want := eventIDs(events), []string{"evt-1", "evt-2"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("eventIDs() = %#v, want %#v", got, want)
-	}
-	if got := len(eventIDs(nil)); got != 0 {
-		t.Fatalf("eventIDs(nil) len = %d, want 0", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := eventIDs(tc.events)
+			assert.Equal(t, tc.want, got)
+			if tc.events == nil {
+				// make([]string, 0) is non-nil even for a nil input.
+				assert.NotNil(t, got)
+			}
+		})
 	}
 }
 
