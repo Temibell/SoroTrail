@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func mkReq(method, path string) *http.Request {
@@ -51,13 +53,82 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
-func TestClientKeyUsesRemoteAddrWhenNoCredential(t *testing.T) {
+// Table test for the rate-limit bucket key (issue #766). Two distinct
+// callers sharing a key means one can exhaust the other's allowance, so the
+// key must separate callers and stay stable per caller.
+func TestClientKey(t *testing.T) {
 	l := NewRateLimiter(1, 1, false)
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	r.RemoteAddr = "203.0.113.9:1234"
-	if got := l.clientKey(r); got != "203.0.113.9" {
-		t.Fatalf("clientKey() = %q, want 203.0.113.9", got)
+
+	keyFor := func(mutate func(r *http.Request)) string {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = "203.0.113.9:1234"
+		if mutate != nil {
+			mutate(r)
+		}
+		return l.clientKey(r)
 	}
+
+	t.Run("two different clients produce different keys", func(t *testing.T) {
+		a := keyFor(func(r *http.Request) { r.RemoteAddr = "203.0.113.9:1111" })
+		b := keyFor(func(r *http.Request) { r.RemoteAddr = "198.51.100.7:2222" })
+		assert.Equal(t, "203.0.113.9", a)
+		assert.Equal(t, "198.51.100.7", b)
+		assert.NotEqual(t, a, b)
+	})
+
+	t.Run("the same client produces a stable key across requests", func(t *testing.T) {
+		// Only the ephemeral port differs between requests.
+		a := keyFor(func(r *http.Request) { r.RemoteAddr = "203.0.113.9:1111" })
+		b := keyFor(func(r *http.Request) { r.RemoteAddr = "203.0.113.9:9999" })
+		assert.Equal(t, a, b)
+	})
+
+	t.Run("credential-bearing caller keys by identity rather than address", func(t *testing.T) {
+		sameCallerDifferentAddrs := func(header, headerValue, wantCredential string) {
+			a := keyFor(func(r *http.Request) {
+				r.Header.Set(header, headerValue)
+				r.RemoteAddr = "203.0.113.9:1111"
+			})
+			b := keyFor(func(r *http.Request) {
+				r.Header.Set(header, headerValue)
+				r.RemoteAddr = "198.51.100.7:2222"
+			})
+			assert.Equal(t, "api:"+wantCredential, a)
+			assert.Equal(t, a, b, "same credential from different addresses must share one bucket")
+		}
+		sameCallerDifferentAddrs("X-API-Key", "st_abc123_secret", "st_abc123_secret")
+		sameCallerDifferentAddrs("Authorization", "Bearer st_abc123_secret", "st_abc123_secret")
+
+		// Different credentials from one address must not collide.
+		a := keyFor(func(r *http.Request) { r.Header.Set("X-API-Key", "key-one") })
+		b := keyFor(func(r *http.Request) { r.Header.Set("X-API-Key", "key-two") })
+		assert.NotEqual(t, a, b)
+
+		// Bearer wins when both headers are present.
+		both := keyFor(func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer bearer-key")
+			r.Header.Set("X-API-Key", "xapi-key")
+		})
+		assert.Equal(t, "api:bearer-key", both)
+	})
+
+	t.Run("anonymous caller falls back to the documented key", func(t *testing.T) {
+		// RemoteAddr host, port stripped.
+		assert.Equal(t, "203.0.113.9", keyFor(nil))
+		// No usable address at all: the documented "unknown" bucket.
+		assert.Equal(t, "unknown", keyFor(func(r *http.Request) { r.RemoteAddr = "" }))
+		assert.Equal(t, "unknown", keyFor(func(r *http.Request) { r.RemoteAddr = "not-an-address" }))
+	})
+
+	t.Run("the key contains no unbounded caller-supplied text", func(t *testing.T) {
+		// A spoofed or malformed X-Forwarded-For must never land in the
+		// key: unparseable parts are skipped, and the key stays the parsed
+		// source address.
+		r := keyFor(func(r *http.Request) {
+			r.Header.Set("X-Forwarded-For", "not-an-ip, definitely-not-an-ip-either")
+		})
+		assert.Equal(t, "203.0.113.9", r)
+	})
 }
 
 func TestCeilSeconds(t *testing.T) {
