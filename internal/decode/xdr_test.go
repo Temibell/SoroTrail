@@ -2,6 +2,7 @@ package decode
 
 import (
 	"encoding/json"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -404,5 +405,70 @@ func TestXDRDecoder_InvalidScValConversion(t *testing.T) {
 		assert.JSONEq(t, `{"map":[{"key":{"void":null},"val":{"void":null}}]}`, string(got))
 		// Counter must not have been incremented for a successful decode.
 		assert.Equal(t, old, decodeErrors.Load())
+	})
+}
+
+// Table test for the 256-bit unsigned renderer (issue #772).
+func TestUint256String(t *testing.T) {
+	const maxWord = ^uint64(0)
+
+	cases := []struct {
+		name  string
+		parts xdr.UInt256Parts
+		want  string
+	}{
+		{
+			name:  "zero renders as 0",
+			parts: xdr.UInt256Parts{},
+			want:  "0",
+		},
+		{
+			name:  "value in the lowest word",
+			parts: xdr.UInt256Parts{LoLo: 7},
+			want:  "7",
+		},
+		{
+			name:  "value in the highest word renders 2^192",
+			parts: xdr.UInt256Parts{HiHi: 1},
+			want:  "6277101735386680763835789423207666416102355444464034512896",
+		},
+		{
+			name:  "maximum unsigned 256-bit value renders without truncation",
+			parts: xdr.UInt256Parts{HiHi: xdr.Uint64(maxWord), HiLo: xdr.Uint64(maxWord), LoHi: xdr.Uint64(maxWord), LoLo: xdr.Uint64(maxWord)},
+			want:  "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := uint256String(tc.parts)
+			assert.Equal(t, tc.want, got)
+			// Unsigned: the result never carries a minus sign.
+			assert.False(t, strings.HasPrefix(got, "-"))
+		})
+	}
+
+	t.Run("mid-range value round-trips through big.Int", func(t *testing.T) {
+		parts := xdr.UInt256Parts{
+			HiHi: 0x0102030405060708,
+			HiLo: 0x090a0b0c0d0e0f10,
+			LoHi: 0x1112131415161718,
+			LoLo: 0x191a1b1c1d1e1f20,
+		}
+		want := new(big.Int).Or(
+			new(big.Int).Lsh(new(big.Int).SetUint64(uint64(parts.HiHi)), 192),
+			new(big.Int).Or(
+				new(big.Int).Lsh(new(big.Int).SetUint64(uint64(parts.HiLo)), 128),
+				new(big.Int).Or(
+					new(big.Int).Lsh(new(big.Int).SetUint64(uint64(parts.LoHi)), 64),
+					new(big.Int).SetUint64(uint64(parts.LoLo)),
+				),
+			),
+		)
+
+		got := uint256String(parts)
+		parsed, ok := new(big.Int).SetString(got, 10)
+		require.True(t, ok, "uint256String = %q is not decimal", got)
+		assert.Equal(t, want, parsed)
+		assert.False(t, strings.HasPrefix(got, "-"))
 	})
 }
