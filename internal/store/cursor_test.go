@@ -1,9 +1,14 @@
 package store
 
 import (
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEncodeDecodeCompositeCursorRoundTrip(t *testing.T) {
@@ -69,4 +74,95 @@ func TestEncodeCursorCompositeOrdersRoundTrip(t *testing.T) {
 			t.Fatalf("sort = %q, want 99", sv)
 		}
 	}
+}
+
+// Table test for the composite cursor encoder (issue #770). The cursor is
+// the API's pagination contract: it must round-trip exactly, stay opaque,
+// and be unambiguous about component order.
+func TestEncodeCompositeCursor(t *testing.T) {
+	cases := []struct {
+		name      string
+		sortValue string
+		id        string
+	}{
+		{
+			name:      "ledger sort value with a TOID id",
+			sortValue: "123",
+			id:        "0000000123-0000000001",
+		},
+		{
+			name:      "timestamp sort value",
+			sortValue: "2024-01-02T03:04:05.000000000Z",
+			id:        "0000000456-0000000002",
+		},
+		{
+			name:      "sort value containing the separator character stays decodable",
+			sortValue: "a|b",
+			id:        "c",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enc := encodeCompositeCursor(tc.sortValue, tc.id)
+			assert.NotEmpty(t, enc, "encoded cursor must not be empty")
+
+			// Ordering preserved: the pair round-trips to the same components.
+			sv, id, err := decodeCompositeCursor(enc)
+			require.NoError(t, err)
+			assert.Equal(t, tc.sortValue, sv, "sort value must round-trip")
+			assert.Equal(t, tc.id, id, "id must round-trip")
+
+			// Opaque: no readable ordering data leaks into the encoded form.
+			if tc.sortValue != "" {
+				assert.NotContains(t, enc, tc.sortValue)
+			}
+			if tc.id != "" {
+				assert.NotContains(t, enc, tc.id)
+			}
+			assert.NotContains(t, enc, "|")
+		})
+	}
+
+	t.Run("component ordering is preserved, not swapped", func(t *testing.T) {
+		// Distinct components so a swap would not pass silently.
+		sortValue, id := "777", "id-value"
+		raw, err := base64.RawURLEncoding.DecodeString(encodeCompositeCursor(sortValue, id))
+		require.NoError(t, err)
+		sep := strings.LastIndex(string(raw), "|")
+		require.GreaterOrEqual(t, sep, 0)
+		assert.Equal(t, sortValue, string(raw[:sep]), "sort value must come before the separator")
+		assert.Equal(t, id, string(raw[sep+1:]), "id must come after the separator")
+	})
+
+	t.Run("cursor encoded under one ordering is rejected under another", func(t *testing.T) {
+		// OrderByID cursors are the raw event id, never a composite. Fed to
+		// the composite decoder (the ledger/created_at path) they must be
+		// rejected with the typed error the handler maps to 400, not
+		// silently interpreted as a position.
+		_, _, err := decodeCompositeCursor("0000000123-0000000001")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidCursor)
+	})
+
+	t.Run("zero position encodes to the documented empty cursor", func(t *testing.T) {
+		// The zero Event's id is "", and OrderByID uses the id alone, so the
+		// zero position encodes to "" — the documented empty cursor that
+		// means "no cursor" (start of data / end of pages).
+		assert.Empty(t, EncodeCursor(OrderByID, Event{}))
+	})
+
+	t.Run("empty components are rejected on decode", func(t *testing.T) {
+		// The encoder can carry an empty sort value, but decoding it must
+		// surface a typed error the handler maps to 400, never a valid
+		// position — a component-less cursor has no defined ordering.
+		for _, tc := range []struct{ sortValue, id string }{
+			{"", "some-id"},
+			{"123", ""},
+			{"", ""},
+		} {
+			_, _, err := decodeCompositeCursor(encodeCompositeCursor(tc.sortValue, tc.id))
+			require.Error(t, err, "cursor %q/%q must not decode", tc.sortValue, tc.id)
+			assert.ErrorIs(t, err, ErrInvalidCursor)
+		}
+	})
 }
